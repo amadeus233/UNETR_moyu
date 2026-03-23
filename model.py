@@ -62,6 +62,10 @@ class UNETR(nn.Module):
         patch_size = (config["patch_height"], config["patch_width"])
         n_patches = (config["image_height"] // patch_size[0]) * (config["image_width"] // patch_size[1])
         
+        # Store patch grid dimensions for reshaping in forward
+        self.patch_h = config["image_height"] // patch_size[0]
+        self.patch_w = config["image_width"] // patch_size[1]
+        
         # Linear Projection Layer - Change Picture To Numbers
         # Use Conv2d to project patches to hidden dimension directly
         self.patch_embedding = nn.Conv2d(
@@ -72,20 +76,58 @@ class UNETR(nn.Module):
         )
         
         # Positional Embedding - Give Position Information To Network
-        self.positions = torch.arange(start=0, end=n_patches, step=1).long()
+        self.register_buffer('positions', torch.arange(start=0, end=n_patches, step=1).long())
         self.positions_embeddings = nn.Embedding(n_patches, config["hidden_dim"])
         
         # Transformer Encoder - The Brain Of Model Learn Features
-        self.encoder_layers = []
+        # CRITICAL: Use ModuleList so layers are registered and move to GPU correctly
+        self.encoder_layers = nn.ModuleList()
         for i in range(config["num_layers"]):
-            layer = nn.TransformerEncoderLayer(d_model=config["hidden_dim"],nhead=config["num_layers"], dim_feedforward = config["mlp_dim"], dropout = config["dropout_rate"], activation = nn.GELU(), batch_first = True)
+            layer = nn.TransformerEncoderLayer(d_model=config["hidden_dim"],nhead=config["num_heads"], dim_feedforward = config["mlp_dim"], dropout = config["dropout_rate"], activation = nn.GELU(), batch_first = True)
             self.encoder_layers.append(layer)
+        
+        # CNN Decoder Layers - Pre-define all convolutional blocks in __init__
+        # This ensures they are registered as modules and move to GPU correctly
+        
+        # Z9-Z12 decoder pathway
+        self.z9_blue1 = BlueBlock(config["hidden_dim"], 512)
+        self.z12_green1 = GreenBlock(config["hidden_dim"], 512)
+        self.z9z12_orange1 = OrangeBlock(1024, 512)  # 512+512 concatenated
+        self.z9z12_orange2 = OrangeBlock(512, 512)
+        
+        # Z6-Z9-Z12 decoder pathway
+        self.z9z12_green2 = GreenBlock(512, 256)
+        self.z6_blue1 = BlueBlock(config["hidden_dim"], 256)  # First upsampling
+        self.z6_blue2 = BlueBlock(256, 256)  # Second upsampling to match
+        self.z6z9z12_orange1 = OrangeBlock(512, 256)  # 256+256 concatenated
+        self.z6z9z12_orange2 = OrangeBlock(256, 256)
+        
+        # Z3-Z6-Z9-Z12 decoder pathway
+        self.z6z9z12_green3 = GreenBlock(256, 128)
+        self.z3_blue1 = BlueBlock(config["hidden_dim"], 128)  # First upsampling
+        self.z3_blue2 = BlueBlock(128, 128)  # Second upsampling to match
+        self.z3_green4 = GreenBlock(128, 128)  # Third upsampling to match z6z9z12_d5
+        self.z3z6z9z12_orange1 = OrangeBlock(256, 128)  # 128+128 concatenated
+        self.z3z6z9z12_orange2 = OrangeBlock(128, 128)
+        
+        # Z0-Z3-Z6-Z9-Z12 decoder pathway (final stages)
+        self.z3z6z9z12_green4 = GreenBlock(128, 64)
+        self.z0_orange1 = OrangeBlock(config["num_channels"], 64)  # num_channels from input
+        self.z0_orange2 = OrangeBlock(64, 64)
+        self.z0z3z6z9z12_orange1 = OrangeBlock(128, 64)  # 64+64 concatenated
+        self.z0z3z6z9z12_orange2 = OrangeBlock(64, 64)
+        
+        # Final classification head - output single channel for binary segmentation
+        self.final_conv = nn.Conv2d(64, 1, kernel_size=1)
             
     
     
     def forward(self, inputs):
         
         batch_size = inputs.shape[0]
+        
+        # Move positional embeddings to same device as inputs - CRITICAL FIX
+        positions = self.positions.to(inputs.device)
         
         # Linear Projection And Positional Embedding - First Step Processing Input
         patch_embedding = self.patch_embedding(inputs)  # (batch, hidden_dim, h/patch_h, w/patch_w)
@@ -96,7 +138,6 @@ class UNETR(nn.Module):
         patch_embedding = patch_embedding.flatten(2).transpose(-1, -2)  # Rearrange to (batch, num_patches, hidden_dim)
         # print("Patch Embedding Shape After Flattening : ", patch_embedding.shape)
         
-        positions = self.positions
         positions_embeddings = self.positions_embeddings(positions)
         # print("Positions Embeddings Shape : ", positions_embeddings.shape)
         x = patch_embedding + positions_embeddings
@@ -115,56 +156,60 @@ class UNETR(nn.Module):
             
         # Convolutional Decoder - Rebuild Segmentation Mask From Features
         z3, z6, z9, z12 = feature_map
-        hidden_shape = (batch_size, self.config["hidden_dim"], self.config["patch_width"], self.config["patch_height"])
-        # print("CNN Decoder Feature Maps Shape Before Reshaping : ", z3.shape, z6.shape, z9.shape, z12.shape)
+        # Use calculated patch dimensions for reshaping
+        hidden_shape = (batch_size, self.config["hidden_dim"], self.patch_h, self.patch_w)
+        print("DEBUG - Patch dimensions: patch_h=%d, patch_w=%d" % (self.patch_h, self.patch_w))
+        print("DEBUG - Feature shapes before reshape: z3=%s, z6=%s, z9=%s, z12=%s" % (str(z3.shape), str(z6.shape), str(z9.shape), str(z12.shape)))
         z3 = z3.view(hidden_shape)
         z6 = z6.view(hidden_shape)
         z9 = z9.view(hidden_shape)
         z12 = z12.view(hidden_shape)
-        # print("CNN Decoder Feature Maps Shape After Reshaping : ", z3.shape, z6.shape, z9.shape, z12.shape)
+        print("DEBUG - Feature shapes after reshape: z3=%s, z6=%s, z9=%s, z12=%s" % (str(z3.shape), str(z6.shape), str(z9.shape), str(z12.shape)))
         
         
         # z9 and z12 Decoder Part - Combine Two Deep Level Features Together
-        z9_d1 = BlueBlock(self.config["hidden_dim"], 512)(z9)
-        z12_d1 = GreenBlock(self.config["hidden_dim"], 512)(z12)
+        z9_d1 = self.z9_blue1(z9)
+        z12_d1 = self.z12_green1(z12)
+        print("DEBUG - z9_d1=%s, z12_d1=%s" % (str(z9_d1.shape), str(z12_d1.shape)))
         z9z12_d1 = torch.cat([z9_d1, z12_d1], dim = 1)
-        z9z12_d2 = OrangeBlock(512 + 512, 512)(z9z12_d1)
-        z9z12_d2 = OrangeBlock(512, 512)(z9z12_d2)
-        # print("Z9-Z12 DECODER OUTPUT SHAPE : ", z9z12_d2.shape)
+        z9z12_d2 = self.z9z12_orange1(z9z12_d1)
+        z9z12_d2 = self.z9z12_orange2(z9z12_d2)
+        print("DEBUG - Z9-Z12 decoder output: z9z12_d2=%s" % str(z9z12_d2.shape))
         
         # z6 and z9-z12 Decoder Part - Add Middle Level Feature Information
-        z9z12_d3 = GreenBlock(512, 256)(z9z12_d2)
-        z6_d1 = BlueBlock(self.config["hidden_dim"], 256)(z6)
-        z6_d1 = BlueBlock(256, 256)(z6_d1)
+        z9z12_d3 = self.z9z12_green2(z9z12_d2)  # [B, 256, 64, 64]
+        z6_d1 = self.z6_blue1(z6)  # [B, 256, 32, 32]
+        z6_d1 = self.z6_blue2(z6_d1)  # [B, 256, 64, 64] - match z9z12_d3
+        print("DEBUG - z9z12_d3=%s, z6_d1(after 2nd blue)=%s" % (str(z9z12_d3.shape), str(z6_d1.shape)))
         z6z9z12_d3 = torch.cat([z6_d1, z9z12_d3], dim = 1)
-        z6z9z12_d4 = OrangeBlock(256 + 256, 256)(z6z9z12_d3)
-        z6z9z12_d4 = OrangeBlock(256, 256)(z6z9z12_d4)
-        # print("Z6-Z9-Z12 DECODER OUTPUT SHAPE : ", z6z9z12_d4.shape)
+        z6z9z12_d4 = self.z6z9z12_orange1(z6z9z12_d3)
+        z6z9z12_d4 = self.z6z9z12_orange2(z6z9z12_d4)
+        print("DEBUG - Z6-Z9-Z12 decoder output: z6z9z12_d4=%s" % str(z6z9z12_d4.shape))
         
         # z3 and z6-z9-z12 Decoder Part - More Shallow Features Join Network
-        z6z9z12_d5 = GreenBlock(256, 128)(z6z9z12_d4)
-        z3_d1 = BlueBlock(self.config["hidden_dim"], 128)(z3)
-        z3_d1 = BlueBlock(128, 128)(z3_d1)
-        z3_d1 = BlueBlock(128, 128)(z3_d1)
+        z6z9z12_d5 = self.z6z9z12_green3(z6z9z12_d4)  # [B, 128, 128, 128]
+        z3_d1 = self.z3_blue1(z3)  # [B, 128, 32, 32]
+        z3_d1 = self.z3_blue2(z3_d1)  # [B, 128, 64, 64]
+        z3_d1 = self.z3_green4(z3_d1)  # [B, 128, 128, 128] - NOW MATCH z6z9z12_d5!
+        print("DEBUG - z6z9z12_d5=%s, z3_d1(after green4)=%s" % (str(z6z9z12_d5.shape), str(z3_d1.shape)))
         z3z6z9z12_d5 = torch.cat([z3_d1, z6z9z12_d5], dim = 1)
-        z3z6z9z12_d6 = OrangeBlock(128 + 128, 128)(z3z6z9z12_d5)
-        z3z6z9z12_d6 = OrangeBlock(128, 128)(z3z6z9z12_d6)
-        # print("Z3-Z6-Z9-Z12 DECODER OUTPUT SHAPE : ", z3z6z9z12_d6.shape)
+        z3z6z9z12_d6 = self.z3z6z9z12_orange1(z3z6z9z12_d5)
+        z3z6z9z12_d6 = self.z3z6z9z12_orange2(z3z6z9z12_d6)
         
         # z0 and z3-z6-z9-z12 Decoder Part - Original Image Connect With All Processed Features
         z0 = inputs.view(batch_size, self.config["num_channels"], self.config["image_width"], self.config["image_height"])
         # print("Z0 after Reshaping : ", z0.shape)
-        z3z6z9z12_d7 = GreenBlock(128, 64)(z3z6z9z12_d6)
-        z0_d1 = OrangeBlock(z0.shape[1], 64)(z0)
-        z0_d1 = OrangeBlock(64, 64)(z0_d1)
+        z3z6z9z12_d7 = self.z3z6z9z12_green4(z3z6z9z12_d6)
+        z0_d1 = self.z0_orange1(z0)
+        z0_d1 = self.z0_orange2(z0_d1)
         z0z3z6z9z12_d7 = torch.cat([z0_d1, z3z6z9z12_d7], dim = 1)
-        z0z3z6z9z12_d8 = OrangeBlock(64+64, 64)(z0z3z6z9z12_d7)
-        z0z3z6z9z12_d8 = OrangeBlock(64, 64)(z0z3z6z9z12_d8)
+        z0z3z6z9z12_d8 = self.z0z3z6z9z12_orange1(z0z3z6z9z12_d7)
+        z0z3z6z9z12_d8 = self.z0z3z6z9z12_orange2(z0z3z6z9z12_d8)
         # print("Z0-Z3-Z6-Z9-Z12 DECODER OUTPUT SHAPE : ", z0z3z6z9z12_d8.shape)
         
         
         # Output (the mask) - Final Prediction Result Come Out
-        output = GreyBlock(64, 1)(z0z3z6z9z12_d8)
+        output = self.final_conv(z0z3z6z9z12_d8)
         return output
         
     

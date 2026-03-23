@@ -37,16 +37,44 @@ env/
 *~
 .DS_Store
 
-# PyTorch
+# PyTorch Checkpoints (keep only best model)
 *.pth
 *.pt
-*.tar.tar
-model_best.pth.tar
+!model_best.pth.tar
 
-# Outputs and Results
-outputs/
-segmentation_result.png
-test_output.png
+# Large Data Directories
+data/train/images/
+data/train/masks/
+data/val/images/
+data/val/masks/
+data/test/images/
+data/test/masks/
+
+# Keep placeholder .gitignore in data folders
+!data/**/.gitkeep
+
+# Outputs (optional - uncomment to exclude)
+# outputs/
+# segmentation_result.png
+# test_output.png
+
+# Visualization Results (keep reconstructed analysis)
+!visualization_results/reconstructed_100_epochs/*
+visualization_results/binary_*
+visualization_results/ultimate_*
+
+# Temporary and Test Files
+cleanup_*.bat
+cleanup_*.py
+analyze_training.py
+visualize_full_training.py
+prepare_for_git.bat
+TEST_REPORT.md
+
+# Large Datasets (do not commit to Git)
+archive/
+data/
+visualization_results/
 
 # Logs
 *.log
